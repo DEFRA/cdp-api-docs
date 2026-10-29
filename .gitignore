@@ -1,12 +1,4 @@
 .DS_Store
-.npm/
 .vscode
 .idea
-.public
-node_modules
-npm-debug.log
-coverage
-.cache
-.envrc
-tsconfig.tsbuildinfo
 .env
