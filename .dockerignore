@@ -1,3 +1,5 @@
-node_modules
-Dockerfile
-coverage
+.git
+.github
+compose
+compose.yml
+README.md
