@@ -18,5 +18,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Lint shell scripts
+        run: shellcheck scripts/*.sh compose/floci/start.d/*.sh
+
       - name: Build Docker image
         run: docker build --no-cache --tag cdp-api-docs .
+
+      - name: Smoke test Docker image
+        run: |
+          docker run -d --name cdp-api-docs -p 8085:8085 \
+            -v "$PWD/test-site:/srv/site:ro" -e SYNC_ENABLED=false cdp-api-docs
+          for _ in $(seq 1 10); do
+            curl -sf http://localhost:8085/health && break
+            sleep 1
+          done
+          curl -sf http://localhost:8085/health
+          curl -sf http://localhost:8085/api/test-service/latest/ | grep -q 'Test Service API'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8085/api/test-service/latest)" = 301
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8085/missing)" = 404
+          docker logs cdp-api-docs

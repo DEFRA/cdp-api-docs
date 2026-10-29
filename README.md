@@ -1,196 +1,94 @@
 # cdp-api-docs
 
-[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=DEFRA_cdp-api-docs&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=DEFRA_cdp-api-docs)
-[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=DEFRA_cdp-api-docs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=DEFRA_cdp-api-docs)
-[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=DEFRA_cdp-api-docs&metric=coverage)](https://sonarcloud.io/summary/new_code?id=DEFRA_cdp-api-docs)
+Serves the CDP API docs site. On start-up and then on a timer, it copies the api docs S3 bucket to local disk and
+serves it with nginx. The bucket is the complete static site; tenant builds publish their docs into it under
+`api/<service>/<version>/`.
 
-Core delivery platform Node.js Frontend Template.
-
-- [Requirements](#requirements)
-  - [Node.js](#nodejs)
-- [Server-side Caching](#server-side-caching)
-- [Redis](#redis)
-- [Local Development](#local-development)
-  - [Setup](#setup)
-  - [Development](#development)
-  - [Production](#production)
-  - [Npm scripts](#npm-scripts)
-  - [Update dependencies](#update-dependencies)
-  - [Formatting](#formatting)
-    - [Windows prettier issue](#windows-prettier-issue)
-- [Docker](#docker)
-  - [Development image](#development-image)
-  - [Production image](#production-image)
-  - [Docker Compose](#docker-compose)
-  - [Dependabot](#dependabot)
-  - [SonarCloud](#sonarcloud)
+- [How it works](#how-it-works)
+- [Configuration](#configuration)
+- [Logs](#logs)
+- [Local development](#local-development)
+  - [Serve a local folder](#serve-a-local-folder)
+  - [Sync from local S3](#sync-from-local-s3)
+  - [Sync from the real bucket](#sync-from-the-real-bucket)
 - [Licence](#licence)
-  - [About the licence](#about-the-licence)
 
-## Requirements
+## How it works
 
-### Node.js
+1. `scripts/entrypoint.sh` runs one sync before nginx starts. If it fails (no bucket, no access) the container exits.
+2. `scripts/sync.sh loop` then re-syncs every `SYNC_INTERVAL_SECONDS` in the background.
+3. Each sync goes into `/srv/staging`. When something changed, it is hard-linked into a new folder under
+   `/srv/releases` and the `/srv/site` symlink is switched to it in one step, so nginx never serves a half-finished
+   sync. The previous release is kept; older ones are deleted.
+4. If a later sync fails, the error is logged and the last good copy keeps being served.
 
-Please install Node Version Manager [nvm](https://github.com/creationix/nvm)
+nginx (`nginx.conf.template`) listens on `PORT`, answers `/health` for the platform healthcheck, serves `index.html` for
+folder URLs and redirects `/folder` to `/folder/` with a relative `Location`.
 
-To use the correct version of Node.js for this application, via nvm:
+## Configuration
 
-```bash
-cd cdp-api-docs
-nvm use
-```
+| Variable                | Default | Description                                                    |
+|-------------------------|---------|----------------------------------------------------------------|
+| `BUCKET`                |         | Bucket holding the docs site. Required unless sync is disabled |
+| `SYNC_INTERVAL_SECONDS` | `60`    | Seconds between syncs                                          |
+| `SYNC_ENABLED`          | `true`  | `false` serves whatever is already in `/srv/site`              |
+| `PORT`                  | `8085`  | Port nginx listens on                                          |
+| `AWS_ENDPOINT_URL`      |         | S3 endpoint override, for local S3                             |
 
-## Server-side Caching
+Deployed values live in [cdp-app-config](https://github.com/DEFRA/cdp-app-config/tree/main/services/cdp-api-docs).
+The service's role needs `s3:ListBucket` and `s3:GetObject` on the bucket.
 
-We use Catbox for server-side caching. By default the service will use CatboxRedis when deployed and CatboxMemory for
-local development.
-You can override the default behaviour by setting the `SESSION_CACHE_ENGINE` environment variable to either `redis` or
-`memory`.
+## Logs
 
-Please note: CatboxMemory (`memory`) is _not_ suitable for production use! The cache will not be shared between each
-instance of the service and it will not persist between restarts.
-
-## Redis
-
-Redis is an in-memory key-value store. Every instance of a service has access to the same Redis key-value store similar
-to how services might have a database (or MongoDB). All frontend services are given access to a namespaced prefixed that
-matches the service name. e.g. `my-service` will have access to everything in Redis that is prefixed with `my-service`.
-
-If your service does not require a session cache to be shared between instances or if you don't require Redis, you can
-disable setting `SESSION_CACHE_ENGINE=false` or changing the default value in `src/config/index.js`.
-
-## Proxy
-
-We are using forward-proxy which is set up by default. Services are automatically configured with the proxy environment variables when deployed.
-
-Node.js 24 uses these variables to route outbound HTTP(S) requests through the proxy:
-
-NODE_USE_ENV_PROXY=1
-HTTPS_PROXY=...
-NO_PROXY=...
-
-No additional proxy configuration is required in the service.
-
-## Local Development
-
-### Setup
-
-Install application dependencies:
+Sync and access logs go to stdout as ECS JSON. Health checks aren't logged. To see what OpenSearch would store:
 
 ```bash
-npm install
+docker compose logs --no-log-prefix cdp-api-docs | npx @defra/cdp-log-pipeline --explain
 ```
 
-### Git hooks
+## Local development
 
-Install git hooks (optional)
+Needs Docker.
+
+### Serve a local folder
+
+`test-site/` holds one fake service. Serve it without S3:
 
 ```bash
-npm run git:hooks
+docker build -t cdp-api-docs .
+docker run --rm -p 8085:8085 -v "$PWD/test-site:/srv/site:ro" -e SYNC_ENABLED=false cdp-api-docs
 ```
 
-### Development
+Then open http://localhost:8085/api/test-service/latest/ and check `curl -i localhost:8085/health`.
 
-To run the application in `development` mode run:
+### Sync from local S3
+
+`compose.yml` starts [Floci](https://github.com/hectorvent/floci) as local S3, creates `cdp-local-api-docs`, uploads
+`test-site/` into it, and runs the service with a 10 second sync interval:
 
 ```bash
-npm run dev
+docker compose up --build
 ```
 
-### Production
-
-To mimic the application running in `production` mode locally run:
+Change the bucket and watch the change appear within one interval:
 
 ```bash
-npm start
+printf '<h1>v2</h1>' | docker compose exec -T floci aws s3 cp - s3://cdp-local-api-docs/api/test-service/0.2.0/index.html
+curl localhost:8085/api/test-service/0.2.0/
 ```
 
-### Npm scripts
+### Sync from the real bucket
 
-All available Npm scripts can be seen in [package.json](./package.json)
-To view them in your command line run:
+With credentials for the management account (e.g. `aws sso login`):
 
 ```bash
-npm run
+docker run --rm -p 8085:8085 \
+  -e BUCKET=cdp-management-api-docs \
+  -e AWS_REGION=eu-west-2 -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+  cdp-api-docs
 ```
 
-### Update dependencies
-
-To update dependencies use [npm-check-updates](https://github.com/raineorshine/npm-check-updates):
-
-> The following script is a good start. Check out all the options on
-> the [npm-check-updates](https://github.com/raineorshine/npm-check-updates)
-
-```bash
-ncu --interactive --format group
-```
-
-### Formatting
-
-#### Windows prettier issue
-
-If you are having issues with formatting of line breaks on Windows update your global git config by running:
-
-```bash
-git config --global core.autocrlf false
-```
-
-## Docker
-
-### Development image
-
-> [!TIP]
-> For Apple Silicon users, you may need to add `--platform linux/amd64` to the `docker run` command to ensure
-> compatibility fEx: `docker build --platform=linux/arm64 --no-cache --tag cdp-api-docs`
-
-Build:
-
-```bash
-docker build --target development --no-cache --tag cdp-api-docs:development .
-```
-
-Run:
-
-```bash
-docker run -p 3000:3000 cdp-api-docs:development
-```
-
-### Production image
-
-Build:
-
-```bash
-docker build --no-cache --tag cdp-api-docs .
-```
-
-Run:
-
-```bash
-docker run -p 3000:3000 cdp-api-docs
-```
-
-### Docker Compose
-
-A local environment with:
-
-- Floci (replacing Localstack) for AWS services (S3, SQS)
-- Redis
-- MongoDB
-- This service.
-- A commented out backend example.
-
-```bash
-docker compose up --build -d
-```
-
-### Dependabot
-
-We have added an example dependabot configuration file to the repository. You can enable it by renaming
-the [.github/example.dependabot.yml](.github/example.dependabot.yml) to `.github/dependabot.yml`
-
-### SonarCloud
-
-Instructions for setting up SonarCloud can be found in [sonar-project.properties](./sonar-project.properties).
+Then open http://localhost:8085/api/cdp-example-node-backend/latest/.
 
 ## Licence
 

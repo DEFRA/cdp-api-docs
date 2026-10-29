@@ -1,0 +1,70 @@
+worker_processes auto;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+
+events {
+  worker_connections 1024;
+}
+
+http {
+  proxy_temp_path /tmp/proxy_temp;
+  client_body_temp_path /tmp/client_temp;
+  fastcgi_temp_path /tmp/fastcgi_temp;
+  uwsgi_temp_path /tmp/uwsgi_temp;
+  scgi_temp_path /tmp/scgi_temp;
+
+  include /etc/nginx/mime.types;
+  default_type application/octet-stream;
+
+  sendfile on;
+  keepalive_timeout 65;
+  server_tokens off;
+
+  # $uri becomes .../index.html after try_files; log the path that was asked for.
+  map $request_uri $request_path {
+    ~^(?<path>[^?]*) $path;
+  }
+
+  # Nested keys, not dotted ones: the CDP log pipeline treats them differently.
+  log_format ecs escape=json
+    '{"@timestamp":"$time_iso8601",'
+    '"log.level":"info",'
+    '"message":"$request_method $request_uri $status",'
+    '"http":{"request":{"method":"$request_method"},"response":{"status_code":$status}},'
+    '"url":{"path":"$request_path","query":"$args"},'
+    '"client":{"ip":"$remote_addr"},'
+    '"user_agent":{"original":"$http_user_agent"}}';
+  access_log /dev/stdout ecs;
+
+  # Docs under latest/ change in place, so make browsers revalidate pages.
+  map $sent_http_content_type $cache_control {
+    ~^text/html no-cache;
+    default     "public, max-age=300";
+  }
+
+  server {
+    listen ${PORT};
+    root /srv/site;
+    index index.html;
+
+    # Behind the load balancer, so keep redirects (e.g. /dir to /dir/) relative.
+    absolute_redirect off;
+
+    location = /health {
+      access_log off;
+      default_type application/json;
+      return 200 '{"message":"success"}';
+    }
+
+    location / {
+      add_header Cache-Control $cache_control;
+      try_files $uri $uri/ =404;
+    }
+
+    # A folder without index.html is a 403 in nginx; to a reader it's not found.
+    error_page 403 = @not_found;
+    location @not_found {
+      return 404;
+    }
+  }
+}
